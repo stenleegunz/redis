@@ -258,6 +258,8 @@ func (c *ringShards) Random() (*ringShard, error) {
 func (c *ringShards) Heartbeat(frequency time.Duration) {
 	ticker := time.NewTicker(frequency)
 	defer ticker.Stop()
+
+	ctx := context.TODO()
 	for range ticker.C {
 		var rebalance bool
 
@@ -272,7 +274,7 @@ func (c *ringShards) Heartbeat(frequency time.Duration) {
 		c.mu.RUnlock()
 
 		for _, shard := range shards {
-			err := shard.Client.Ping().Err()
+			err := shard.Client.Ping(ctx).Err()
 			if shard.Vote(err == nil || err == pool.ErrPoolTimeout) {
 				internal.Logger.Printf("ring shard state changed: %s", shard)
 				rebalance = true
@@ -413,21 +415,13 @@ func (c *Ring) WithContext(ctx context.Context) *Ring {
 }
 
 // Do creates a Cmd from the args and processes the cmd.
-func (c *Ring) Do(args ...interface{}) *Cmd {
-	return c.DoContext(c.ctx, args...)
-}
-
-func (c *Ring) DoContext(ctx context.Context, args ...interface{}) *Cmd {
-	cmd := NewCmd(args...)
-	_ = c.ProcessContext(ctx, cmd)
+func (c *Ring) Do(ctx context.Context, args ...interface{}) *Cmd {
+	cmd := NewCmd(ctx, args...)
+	_ = c.Process(ctx, cmd)
 	return cmd
 }
 
-func (c *Ring) Process(cmd Cmder) error {
-	return c.ProcessContext(c.ctx, cmd)
-}
-
-func (c *Ring) ProcessContext(ctx context.Context, cmd Cmder) error {
+func (c *Ring) Process(ctx context.Context, cmd Cmder) error {
 	return c.hooks.process(ctx, cmd, c.process)
 }
 
@@ -461,7 +455,7 @@ func (c *Ring) Len() int {
 }
 
 // Subscribe subscribes the client to the specified channels.
-func (c *Ring) Subscribe(channels ...string) *PubSub {
+func (c *Ring) Subscribe(ctx context.Context, channels ...string) *PubSub {
 	if len(channels) == 0 {
 		panic("at least one channel is required")
 	}
@@ -471,11 +465,11 @@ func (c *Ring) Subscribe(channels ...string) *PubSub {
 		//TODO: return PubSub with sticky error
 		panic(err)
 	}
-	return shard.Client.Subscribe(channels...)
+	return shard.Client.Subscribe(ctx, channels...)
 }
 
 // PSubscribe subscribes the client to the given patterns.
-func (c *Ring) PSubscribe(channels ...string) *PubSub {
+func (c *Ring) PSubscribe(ctx context.Context, channels ...string) *PubSub {
 	if len(channels) == 0 {
 		panic("at least one channel is required")
 	}
@@ -485,12 +479,15 @@ func (c *Ring) PSubscribe(channels ...string) *PubSub {
 		//TODO: return PubSub with sticky error
 		panic(err)
 	}
-	return shard.Client.PSubscribe(channels...)
+	return shard.Client.PSubscribe(ctx, channels...)
 }
 
 // ForEachShard concurrently calls the fn on each live shard in the ring.
 // It returns the first error if any.
-func (c *Ring) ForEachShard(fn func(client *Client) error) error {
+func (c *Ring) ForEachShard(
+	ctx context.Context,
+	fn func(ctx context.Context, client *Client) error,
+) error {
 	shards := c.shards.List()
 	var wg sync.WaitGroup
 	errCh := make(chan error, 1)
@@ -502,7 +499,7 @@ func (c *Ring) ForEachShard(fn func(client *Client) error) error {
 		wg.Add(1)
 		go func(shard *ringShard) {
 			defer wg.Done()
-			err := fn(shard.Client)
+			err := fn(ctx, shard.Client)
 			if err != nil {
 				select {
 				case errCh <- err:
@@ -525,7 +522,7 @@ func (c *Ring) cmdsInfo() (map[string]*CommandInfo, error) {
 	shards := c.shards.List()
 	firstErr := errRingShardsDown
 	for _, shard := range shards {
-		cmdsInfo, err := shard.Client.Command().Result()
+		cmdsInfo, err := shard.Client.Command(context.TODO()).Result()
 		if err == nil {
 			return cmdsInfo, nil
 		}
@@ -581,7 +578,7 @@ func (c *Ring) _process(ctx context.Context, cmd Cmder) error {
 			return err
 		}
 
-		lastErr = shard.Client.ProcessContext(ctx, cmd)
+		lastErr = shard.Client.Process(ctx, cmd)
 		if lastErr == nil || !isRetryableError(lastErr, cmd.readTimeout() == nil) {
 			return lastErr
 		}
@@ -589,8 +586,8 @@ func (c *Ring) _process(ctx context.Context, cmd Cmder) error {
 	return lastErr
 }
 
-func (c *Ring) Pipelined(fn func(Pipeliner) error) ([]Cmder, error) {
-	return c.Pipeline().Pipelined(fn)
+func (c *Ring) Pipelined(ctx context.Context, fn func(Pipeliner) error) ([]Cmder, error) {
+	return c.Pipeline().Pipelined(ctx, fn)
 }
 
 func (c *Ring) Pipeline() Pipeliner {
@@ -608,8 +605,8 @@ func (c *Ring) processPipeline(ctx context.Context, cmds []Cmder) error {
 	})
 }
 
-func (c *Ring) TxPipelined(fn func(Pipeliner) error) ([]Cmder, error) {
-	return c.TxPipeline().Pipelined(fn)
+func (c *Ring) TxPipelined(ctx context.Context, fn func(Pipeliner) error) ([]Cmder, error) {
+	return c.TxPipeline().Pipelined(ctx, fn)
 }
 
 func (c *Ring) TxPipeline() Pipeliner {
@@ -680,7 +677,7 @@ func (c *Ring) Close() error {
 	return c.shards.Close()
 }
 
-func (c *Ring) Watch(fn func(*Tx) error, keys ...string) error {
+func (c *Ring) Watch(ctx context.Context, fn func(*Tx) error, keys ...string) error {
 	if len(keys) == 0 {
 		return fmt.Errorf("redis: Watch requires at least one key")
 	}
@@ -710,7 +707,7 @@ func (c *Ring) Watch(fn func(*Tx) error, keys ...string) error {
 		}
 	}
 
-	return shards[0].Client.Watch(fn, keys...)
+	return shards[0].Client.Watch(ctx, fn, keys...)
 }
 
 func newConsistentHash(opt *RingOptions) *consistenthash.Map {
