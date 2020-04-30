@@ -1,4 +1,4 @@
-module github.com/go-redis/redis/v7
+module github.com/stenleegunz/redis
 
 require (
 	github.com/golang/protobuf v1.3.2 // indirect
